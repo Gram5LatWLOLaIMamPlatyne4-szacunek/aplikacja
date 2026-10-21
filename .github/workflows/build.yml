@@ -1,0 +1,99 @@
+name: Build APK
+run-name: Build ${{ inputs.job }}
+on:
+  workflow_dispatch:
+    inputs:
+      job: { required: true }
+      name: { required: true }
+      appid: { required: true }
+      orient: { required: false, default: '' }
+      release: { required: false, default: 'false' }
+      splash: { required: false, default: '' }
+      status: { required: false, default: '' }
+      nav: { required: false, default: '' }
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      JOB: ${{ inputs.job }}
+      APPNAME: ${{ inputs.name }}
+      APPID: ${{ inputs.appid }}
+      ORIENT: ${{ inputs.orient }}
+      RELEASE: ${{ inputs.release }}
+      SPLASH: ${{ inputs.splash }}
+      STATUS: ${{ inputs.status }}
+      NAV: ${{ inputs.nav }}
+      KS_B64: ${{ secrets.KEYSTORE_BASE64 }}
+      KS_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
+      KS_ALIAS: ${{ secrets.KEY_ALIAS }}
+      KEY_PASS: ${{ secrets.KEY_PASSWORD }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: 17 }
+      - name: Przygotuj stronę
+        run: |
+          mkdir -p www && unzip -q "jobs/$JOB/site.zip" -d www
+          IDX=$(find www -iname index.html | awk '{print length, $0}' | sort -n | head -1 | cut -d' ' -f2-)
+          DIR=$(dirname "$IDX")
+          if [ "$DIR" != "www" ]; then mv "$DIR" /tmp/site && rm -rf www && mv /tmp/site www; fi
+          cp bridge/bonto-bridge.js www/
+          TAG='<script src="bonto-bridge.js"></script>'
+          if grep -qi '<head' www/index.html; then
+            sed -i "0,/<head[^>]*>/I s##&${TAG}#" www/index.html
+          else
+            sed -i "1i ${TAG}" www/index.html
+          fi
+      - name: Capacitor + Android
+        run: |
+          npm install
+          node -e "require('fs').writeFileSync('capacitor.config.json',JSON.stringify({appId:process.env.APPID,appName:process.env.APPNAME,webDir:'www',plugins:{SplashScreen:{launchShowDuration:1200,backgroundColor:process.env.SPLASH||'#ffffff'}}}))"
+          npx cap add android
+      - name: Wygląd, uprawnienia, widżet
+        run: |
+          pip install -q pillow
+          python3 native/customize.py
+          R=android/app/src/main/res
+          PKGDIR=android/app/src/main/java/$(echo "$APPID" | tr . /)
+          cp "$PKGDIR/MainActivity.java" "$PKGDIR/MainActivity.java.orig"
+          cp android/app/src/main/AndroidManifest.xml android/app/src/main/AndroidManifest.xml.orig
+          for f in MainActivity BontoWidgetPlugin BontoWidgetProvider EdupageParse EdupageWatcher EdupageJobService; do
+            sed "s/__PKG__/$APPID/g" native/$f.java > "$PKGDIR/$f.java"
+          done
+          python3 native/addnative.py
+          mkdir -p $R/layout $R/xml
+          cp native/bonto_widget.xml $R/layout/
+          cp native/bonto_widget_info.xml $R/xml/
+          npx cap sync android
+      - name: Build
+        run: |
+          sed -i "s/versionCode 1/versionCode $GITHUB_RUN_NUMBER/" android/app/build.gradle
+          if [ "$RELEASE" = "true" ]; then
+            [ -n "$KS_B64" ] || { echo "Brak sekretów keystore – zob. dokumentacja"; exit 1; }
+            echo "$KS_B64" | base64 -d > /tmp/release.keystore
+            export KS_FILE=/tmp/release.keystore
+            cat native/signing.gradle >> android/app/build.gradle
+            TASKS="assembleRelease bundleRelease"
+          else
+            TASKS="assembleDebug"
+          fi
+          (cd android && ./gradlew $TASKS --no-daemon) || {
+            echo "::warning::Błąd w natywnych dodatkach – buduję bez widżetu i sprawdzania w tle"
+            bash native/strip.sh
+            (cd android && ./gradlew $TASKS --no-daemon)
+          }
+      - name: Publikuj
+        run: |
+          if [ "$RELEASE" = "true" ]; then
+            cp android/app/build/outputs/apk/release/app-release.apk "$JOB.apk"
+            cp android/app/build/outputs/bundle/release/app-release.aab "$JOB.aab"
+            gh release create "job-$JOB" "$JOB.apk" "$JOB.aab" --title "$APPNAME" --notes "$APPID"
+          else
+            cp android/app/build/outputs/apk/debug/app-debug.apk "$JOB.apk"
+            gh release create "job-$JOB" "$JOB.apk" --title "$APPNAME" --notes "$APPID"
+          fi
